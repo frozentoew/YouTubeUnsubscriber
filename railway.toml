@@ -1,0 +1,14 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "node server.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# IMPORTANT: After deploying, add a Railway Volume and set:
+#   Mount Path: /data
+#   DB_PATH env var: /data/tokens.json
+# This ensures the token store persists across deploys and restarts.

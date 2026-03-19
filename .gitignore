@@ -1,0 +1,17 @@
+# Environment variables — never commit secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Token store (persisted via Railway volume, not source control)
+tokens.json
+
+# OS
+.DS_Store
