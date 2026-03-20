@@ -13,11 +13,17 @@ const REQUIRED_ENV = [
   'GOOGLE_REDIRECT_URI',
   'JWT_SECRET',
   'JWT_REFRESH_SECRET',
+  'STORE_ENCRYPTION_KEY',
 ];
 const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missingEnv.length > 0) {
+  // Use console.error + exitCode so the message flushes before the process
+  // exits.  process.stderr.write + process.exit(1) can lose the message on
+  // platforms like Railway where the buffer doesn't drain in time.
   console.error(`Missing required environment variables: ${missingEnv.join(', ')}`);
-  process.exit(1);
+  console.error('Set these in your Railway service variables (not in a .env file).');
+  process.exitCode = 1;
+  return;
 }
 
 const logger = require('./logger');
@@ -47,14 +53,18 @@ app.use(helmet({
   noSniff: true,
 }));
 
-// CORS configuration
+// CORS configuration — always use an explicit allowlist, even in development.
+// Wildcard origin ('*') combined with credentials: true is rejected by browsers
+// and signals misconfiguration.  Use a specific list for every environment.
+const ALLOWED_ORIGINS = process.env.NODE_ENV === 'development'
+  ? ['http://localhost:3000', 'http://127.0.0.1:3000']
+  : [`https://${process.env.APP_DOMAIN}`];
+
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
-    ? [`https://${process.env.APP_DOMAIN}`]
-    : '*',
+  origin: ALLOWED_ORIGINS,
   credentials: true,
   methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Google-Access-Token'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json({ limit: '10kb' })); // Limit payload size
@@ -79,7 +89,21 @@ app.use('/api/', globalLimiter);
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10, // Only 10 auth attempts per 15 minutes
-  skipSuccessfulRequests: true,
+});
+
+// Per-user rate limiting for destructive subscription actions
+const deleteLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,             // Max 30 unsubscribes per minute
+  keyGenerator: (req) => req.user?.userId || req.ip,
+  message: { error: 'Too many unsubscribe requests, please slow down' },
+  handler: (req, res) => {
+    logger.security('DELETE_RATE_LIMIT_EXCEEDED', {
+      userId: req.user?.userId,
+      ip: req.ip,
+    });
+    res.status(429).json({ error: 'Too many unsubscribe requests, please slow down' });
+  },
 });
 
 // Request logging middleware
@@ -93,11 +117,14 @@ app.use((req, res, next) => {
 
 // ============ OAUTH2 CLIENT SETUP ============
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
-);
+// Factory: creates a fresh OAuth2 client per request to avoid credential race conditions
+function createOAuth2Client() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+}
 
 // ============ AUTH MIDDLEWARE ============
 
@@ -161,25 +188,25 @@ app.get('/apple-app-site-association', (req, res) => {
 
 // ============ API ENDPOINTS ============
 
-// Health check
+// Health check — do not expose server timestamp (fingerprinting risk)
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-  });
+  res.json({ status: 'ok' });
 });
 
 // Get OAuth URL with PKCE support [web:60]
 app.post('/api/auth/get-url', authLimiter, (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
-    
+
+    // Store state server-side for CSRF validation on exchange
+    tokenManager.storePendingState(state);
+
     const scopes = [
       'https://www.googleapis.com/auth/youtube.force-ssl'
     ];
 
-    const authUrl = oauth2Client.generateAuthUrl({
+    const client = createOAuth2Client();
+    const authUrl = client.generateAuthUrl({
       access_type: 'offline',
       scope: scopes,
       state: state,
@@ -201,13 +228,20 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
   try {
     const { code, state, codeVerifier } = req.validatedBody;
 
-    logger.info('Token exchange initiated', { 
+    // Validate state parameter against server-side store (CSRF protection)
+    if (!tokenManager.consumePendingState(state)) {
+      logger.security('INVALID_OAUTH_STATE', { ip: req.ip, state });
+      return res.status(400).json({ error: 'Invalid or expired OAuth state' });
+    }
+
+    logger.info('Token exchange initiated', {
       state,
       ip: req.ip,
     });
 
     // Exchange code for tokens with explicit redirect_uri
-    const { tokens } = await oauth2Client.getToken({
+    const client = createOAuth2Client();
+    const { tokens } = await client.getToken({
       code,
       code_verifier: codeVerifier,
       redirect_uri: process.env.GOOGLE_REDIRECT_URI, // Explicitly set redirect_uri
@@ -215,13 +249,22 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
 
     // Generate token family for rotation
     const familyId = tokenManager.generateFamilyId();
-    const userId = tokens.access_token.substring(0, 20);
+
+    // Verify and extract stable user ID from Google's ID token
+    const ticket = await client.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const userId = ticket.getPayload().sub;
+
+    // Store Google tokens server-side (never sent to client)
+    tokenManager.storeGoogleTokens(userId, tokens);
 
     // Generate app tokens with rotation support
     const appAccessToken = tokenManager.generateAccessToken(userId, familyId);
     const appRefreshToken = tokenManager.generateRefreshToken(userId, familyId);
 
-    logger.info('Token exchange successful', { 
+    logger.info('Token exchange successful', {
       userId,
       familyId,
     });
@@ -229,8 +272,6 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
     res.json({
       appToken: appAccessToken,
       refreshToken: appRefreshToken,
-      accessToken: tokens.access_token,
-      googleRefreshToken: tokens.refresh_token,
       expiryDate: tokens.expiry_date,
     });
 
@@ -247,7 +288,7 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
 
 
 // Refresh access token with rotation [web:45]
-app.post('/api/auth/refresh', validate(schemas.authRefresh), async (req, res) => {
+app.post('/api/auth/refresh', authLimiter, validate(schemas.authRefresh), async (req, res) => {
   try {
     const { refreshToken } = req.validatedBody;
     const ipAddress = req.ip;
@@ -261,6 +302,7 @@ app.post('/api/auth/refresh', validate(schemas.authRefresh), async (req, res) =>
     res.json({
       appToken: newTokens.accessToken,
       refreshToken: newTokens.refreshToken,
+      expiryDate: Math.floor(Date.now() / 1000) + 15 * 60, // seconds since epoch
     });
 
   } catch (error) {
@@ -283,16 +325,37 @@ app.post('/api/auth/refresh', validate(schemas.authRefresh), async (req, res) =>
   }
 });
 
+// Helper: get an authenticated YouTube client using server-side Google tokens
+async function getYouTubeClient(userId) {
+  const googleTokens = tokenManager.getGoogleTokens(userId);
+  if (!googleTokens) {
+    return null;
+  }
+
+  const client = createOAuth2Client();
+  client.setCredentials({
+    access_token: googleTokens.accessToken,
+    refresh_token: googleTokens.refreshToken,
+    expiry_date: googleTokens.expiryDate,
+  });
+
+  // Auto-refresh if expired
+  if (googleTokens.expiryDate && Date.now() >= googleTokens.expiryDate - 60000) {
+    const { credentials } = await client.refreshAccessToken();
+    tokenManager.updateGoogleAccessToken(userId, credentials.access_token, credentials.expiry_date);
+    client.setCredentials(credentials);
+  }
+
+  return google.youtube({ version: 'v3', auth: client });
+}
+
 // Get user's subscriptions [web:13]
 app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscriptionsList), async (req, res) => {
   try {
-    const accessToken = req.headers['x-google-access-token'];
-    if (!accessToken) {
-      return res.status(400).json({ error: 'Missing Google access token' });
+    const youtube = await getYouTubeClient(req.user.userId);
+    if (!youtube) {
+      return res.status(401).json({ error: 'Google account not linked', reloginRequired: true });
     }
-
-    oauth2Client.setCredentials({ access_token: accessToken });
-    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
     let allSubscriptions = [];
     let nextPageToken = null;
@@ -347,16 +410,14 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
 });
 
 // Unsubscribe from a channel [web:12]
-app.post('/api/subscriptions/delete', authenticateToken, validate(schemas.subscriptionsDelete), async (req, res) => {
+app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate(schemas.subscriptionsDelete), async (req, res) => {
   try {
-    const accessToken = req.headers['x-google-access-token'];
-    if (!accessToken) {
-      return res.status(400).json({ error: 'Missing Google access token' });
-    }
     const { subscriptionId } = req.validatedBody;
 
-    oauth2Client.setCredentials({ access_token: accessToken });
-    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+    const youtube = await getYouTubeClient(req.user.userId);
+    if (!youtube) {
+      return res.status(401).json({ error: 'Google account not linked', reloginRequired: true });
+    }
 
     await youtube.subscriptions.delete({
       id: subscriptionId,
@@ -394,25 +455,40 @@ app.post('/api/subscriptions/delete', authenticateToken, validate(schemas.subscr
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  logger.error('Unhandled error', {
-    error: error.message,
-    stack: error.stack,
-    path: req.path,
-  });
+  // Only log stack traces in development — in production they can leak
+  // internal file paths and structure if logs are ever exposed.
+  const meta = { error: error.message, path: req.path };
+  if (process.env.NODE_ENV !== 'production') {
+    meta.stack = error.stack;
+  }
+  logger.error('Unhandled error', meta);
 
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // Start server
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Server started on port ${PORT}`, {
     environment: process.env.NODE_ENV,
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM signal received: closing HTTP server');
-  process.exit(0);
-});
+// Graceful shutdown — close the HTTP server, persist token state, then exit.
+function gracefulShutdown(signal) {
+  logger.info(`${signal} received: closing HTTP server`);
+  server.close(() => {
+    logger.info('HTTP server closed — persisting token store');
+    tokenManager.persistNow();
+    process.exit(0);
+  });
+  // Force exit after 10 seconds if connections hang
+  setTimeout(() => {
+    logger.warn('Forced shutdown after timeout');
+    tokenManager.persistNow();
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
