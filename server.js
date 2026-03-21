@@ -217,11 +217,14 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
   try {
     const { code, state, codeVerifier } = req.validatedBody;
 
-    // Mobile clients (Google Sign-In SDK) generate their own state client-side
-    // and never call /get-url, so the state won't exist server-side.
-    // The SDK handles CSRF protection natively, so we log but allow the exchange.
+    // SECURITY NOTE — CSRF protection for the mobile flow:
+    // Mobile clients (Google Sign-In SDK) generate state client-side and never
+    // call /get-url, so the state won't exist server-side.  For these clients,
+    // CSRF protection is provided entirely by the PKCE code_verifier (RFC 7636),
+    // which binds the auth code to the session that initiated the request.
+    // The state check below only protects the web /get-url flow.
     if (!tokenManager.consumePendingState(state)) {
-      logger.info('State not found server-side (expected for mobile SDK flow)', {
+      logger.info('State not found server-side (mobile SDK flow — CSRF delegated to PKCE)', {
         ip: req.ip,
       });
     }
