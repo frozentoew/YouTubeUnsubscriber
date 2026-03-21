@@ -17,9 +17,6 @@ const REQUIRED_ENV = [
 ];
 const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missingEnv.length > 0) {
-  // Use console.error + exitCode so the message flushes before the process
-  // exits.  process.stderr.write + process.exit(1) can lose the message on
-  // platforms like Railway where the buffer doesn't drain in time.
   console.error(`Missing required environment variables: ${missingEnv.join(', ')}`);
   console.error('Set these in your Railway service variables (not in a .env file).');
   process.exitCode = 1;
@@ -54,8 +51,6 @@ app.use(helmet({
 }));
 
 // CORS configuration — always use an explicit allowlist, even in development.
-// Wildcard origin ('*') combined with credentials: true is rejected by browsers
-// and signals misconfiguration.  Use a specific list for every environment.
 const ALLOWED_ORIGINS = process.env.NODE_ENV === 'development'
   ? ['http://localhost:3000', 'http://127.0.0.1:3000']
   : [`https://${process.env.APP_DOMAIN}`];
@@ -88,13 +83,13 @@ app.use('/api/', globalLimiter);
 // Strict rate limiting for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10, // Only 10 auth attempts per 15 minutes
+  max: 10,
 });
 
 // Per-user rate limiting for destructive subscription actions
 const deleteLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30,             // Max 30 unsubscribes per minute
+  windowMs: 60 * 1000,
+  max: 30,
   keyGenerator: (req) => req.user?.userId || req.ip,
   message: { error: 'Too many unsubscribe requests, please slow down' },
   handler: (req, res) => {
@@ -117,7 +112,6 @@ app.use((req, res, next) => {
 
 // ============ OAUTH2 CLIENT SETUP ============
 
-// Factory: creates a fresh OAuth2 client per request to avoid credential race conditions
 function createOAuth2Client() {
   return new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -133,7 +127,7 @@ const authenticateToken = (req, res, next) => {
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
-    logger.security('MISSING_AUTH_TOKEN', { 
+    logger.security('MISSING_AUTH_TOKEN', {
       ip: req.ip,
       path: req.path,
     });
@@ -163,7 +157,6 @@ const authenticateToken = (req, res, next) => {
 
 // ============ UNIVERSAL LINKS SUPPORT ============
 
-// Apple App Site Association file for Universal Links [web:51][web:54]
 app.get('/.well-known/apple-app-site-association', (req, res) => {
   const aasa = {
     applinks: {
@@ -181,24 +174,21 @@ app.get('/.well-known/apple-app-site-association', (req, res) => {
   res.json(aasa);
 });
 
-// Legacy path (without .well-known)
 app.get('/apple-app-site-association', (req, res) => {
   res.redirect(301, '/.well-known/apple-app-site-association');
 });
 
 // ============ API ENDPOINTS ============
 
-// Health check — do not expose server timestamp (fingerprinting risk)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Get OAuth URL with PKCE support [web:60]
+// Get OAuth URL with PKCE support
 app.post('/api/auth/get-url', authLimiter, (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
 
-    // Store state server-side for CSRF validation on exchange
     tokenManager.storePendingState(state);
 
     const scopes = [
@@ -211,7 +201,6 @@ app.post('/api/auth/get-url', authLimiter, (req, res) => {
       scope: scopes,
       state: state,
       prompt: 'consent',
-      // Note: PKCE will be handled client-side [web:60]
     });
 
     logger.info('OAuth URL generated', { state });
@@ -223,15 +212,14 @@ app.post('/api/auth/get-url', authLimiter, (req, res) => {
   }
 });
 
-// Exchange authorization code for tokens with PKCE verification [web:60][web:63]
+// Exchange authorization code for tokens with PKCE verification
 app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), async (req, res) => {
   try {
     const { code, state, codeVerifier } = req.validatedBody;
 
-    // Validate state parameter against server-side store (CSRF protection).
     // Mobile clients (Google Sign-In SDK) generate their own state client-side
-    // and never call /get-url, so the state won't exist server-side.  The SDK
-    // handles CSRF protection natively, so we log but allow the exchange.
+    // and never call /get-url, so the state won't exist server-side.
+    // The SDK handles CSRF protection natively, so we log but allow the exchange.
     if (!tokenManager.consumePendingState(state)) {
       logger.info('State not found server-side (expected for mobile SDK flow)', {
         ip: req.ip,
@@ -243,28 +231,23 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
       ip: req.ip,
     });
 
-    // Exchange code for tokens with explicit redirect_uri
     const client = createOAuth2Client();
     const { tokens } = await client.getToken({
       code,
       code_verifier: codeVerifier,
-      redirect_uri: process.env.GOOGLE_REDIRECT_URI, // Explicitly set redirect_uri
+      redirect_uri: process.env.GOOGLE_REDIRECT_URI,
     });
 
-    // Generate token family for rotation
     const familyId = tokenManager.generateFamilyId();
 
-    // Verify and extract stable user ID from Google's ID token
     const ticket = await client.verifyIdToken({
       idToken: tokens.id_token,
       audience: process.env.GOOGLE_CLIENT_ID,
     });
     const userId = ticket.getPayload().sub;
 
-    // Store Google tokens server-side (never sent to client)
     tokenManager.storeGoogleTokens(userId, tokens);
 
-    // Generate app tokens with rotation support
     const appAccessToken = tokenManager.generateAccessToken(userId, familyId);
     const appRefreshToken = tokenManager.generateRefreshToken(userId, familyId);
 
@@ -285,19 +268,17 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
       error: error.response?.data?.error || error.message,
       errorDescription: error.response?.data?.error_description,
     });
-    
+
     res.status(400).json({ error: 'Failed to exchange authorization code' });
   }
 });
 
-
-// Refresh access token with rotation [web:45]
+// Refresh access token with rotation
 app.post('/api/auth/refresh', authLimiter, validate(schemas.authRefresh), async (req, res) => {
   try {
     const { refreshToken } = req.validatedBody;
     const ipAddress = req.ip;
 
-    // Rotate refresh token (detects replay attacks)
     const newTokens = await tokenManager.rotateRefreshToken(
       refreshToken,
       ipAddress
@@ -306,7 +287,7 @@ app.post('/api/auth/refresh', authLimiter, validate(schemas.authRefresh), async 
     res.json({
       appToken: newTokens.accessToken,
       refreshToken: newTokens.refreshToken,
-      expiryDate: Math.floor(Date.now() / 1000) + 15 * 60, // seconds since epoch
+      expiryDate: Math.floor(Date.now() / 1000) + 15 * 60,
     });
 
   } catch (error) {
@@ -316,13 +297,13 @@ app.post('/api/auth/refresh', authLimiter, validate(schemas.authRefresh), async 
     });
 
     if (error.message.includes('reuse detected')) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Security breach detected. Please login again.',
         reloginRequired: true,
       });
     }
 
-    res.status(401).json({ 
+    res.status(401).json({
       error: 'Failed to refresh token',
       reloginRequired: true,
     });
@@ -343,7 +324,6 @@ async function getYouTubeClient(userId) {
     expiry_date: googleTokens.expiryDate,
   });
 
-  // Auto-refresh if expired
   if (googleTokens.expiryDate && Date.now() >= googleTokens.expiryDate - 60000) {
     const { credentials } = await client.refreshAccessToken();
     tokenManager.updateGoogleAccessToken(userId, credentials.access_token, credentials.expiry_date);
@@ -353,7 +333,7 @@ async function getYouTubeClient(userId) {
   return google.youtube({ version: 'v3', auth: client });
 }
 
-// Get user's subscriptions [web:13]
+// Get user's subscriptions
 app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscriptionsList), async (req, res) => {
   try {
     const youtube = await getYouTubeClient(req.user.userId);
@@ -396,24 +376,24 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
       error: error.message,
       code: error.code,
     });
-    
+
     if (error.code === 403) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Quota exceeded. Try again after 08:00 UTC.',
         quotaExceeded: true,
       });
     } else if (error.code === 401) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Token expired',
         needsRefresh: true,
       });
     }
-    
+
     res.status(500).json({ error: 'Failed to fetch subscriptions' });
   }
 });
 
-// Unsubscribe from a channel [web:12]
+// Unsubscribe from a channel
 app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate(schemas.subscriptionsDelete), async (req, res) => {
   try {
     const { subscriptionId } = req.validatedBody;
@@ -440,27 +420,25 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
       error: error.message,
       code: error.code,
     });
-    
+
     if (error.code === 403) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Quota exceeded',
         quotaExceeded: true,
       });
     } else if (error.code === 401) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Token expired',
         needsRefresh: true,
       });
     }
-    
+
     res.status(500).json({ error: 'Failed to unsubscribe' });
   }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  // Only log stack traces in development — in production they can leak
-  // internal file paths and structure if logs are ever exposed.
   const meta = { error: error.message, path: req.path };
   if (process.env.NODE_ENV !== 'production') {
     meta.stack = error.stack;
@@ -477,7 +455,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   });
 });
 
-// Graceful shutdown — close the HTTP server, persist token state, then exit.
+// Graceful shutdown
 function gracefulShutdown(signal) {
   logger.info(`${signal} received: closing HTTP server`);
   server.close(() => {
@@ -485,7 +463,6 @@ function gracefulShutdown(signal) {
     tokenManager.persistNow();
     process.exit(0);
   });
-  // Force exit after 10 seconds if connections hang
   setTimeout(() => {
     logger.warn('Forced shutdown after timeout');
     tokenManager.persistNow();
@@ -495,4 +472,3 @@ function gracefulShutdown(signal) {
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-

@@ -3,7 +3,7 @@ const Joi = require('joi');
 const schemas = {
   authExchange: Joi.object({
     code: Joi.string().min(10).max(1000).required(),
-    state: Joi.string().uuid().required(),
+    state: Joi.string().min(1).max(200).required(),
     codeVerifier: Joi.string().min(43).max(128).required(),
   }),
 
@@ -11,7 +11,6 @@ const schemas = {
     refreshToken: Joi.string().min(10).max(1000).required(),
   }),
 
-  // accessToken is now passed via X-Google-Access-Token header, not body
   subscriptionsList: Joi.object({}),
 
   subscriptionsDelete: Joi.object({
@@ -35,7 +34,6 @@ const validate = (schema) => {
         errors,
       });
 
-      // Do not expose validation detail to clients
       return res.status(400).json({ error: 'Invalid request data' });
     }
 

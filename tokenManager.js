@@ -7,30 +7,95 @@ const logger = require('./logger');
 // DB_PATH can be overridden via env var — set to /data/tokens.json on Railway with a volume
 const storePath = process.env.DB_PATH || path.join(__dirname, 'tokens.json');
 
+// ── Encryption helpers (AES-256-GCM) ──────────────────────────────────────────
+
+const ENCRYPTION_KEY = process.env.STORE_ENCRYPTION_KEY
+  ? Buffer.from(process.env.STORE_ENCRYPTION_KEY, 'hex')
+  : null;
+
+if (!ENCRYPTION_KEY) {
+  logger.warn('STORE_ENCRYPTION_KEY not set — token store will not be encrypted at rest');
+} else if (ENCRYPTION_KEY.length !== 32) {
+  logger.error('STORE_ENCRYPTION_KEY must be 32 bytes (64 hex chars) — exiting');
+  process.exit(1);
+}
+
+function encryptStore(plaintext) {
+  if (!ENCRYPTION_KEY) return JSON.stringify({ plain: plaintext });
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return JSON.stringify({
+    iv: iv.toString('hex'),
+    authTag: cipher.getAuthTag().toString('hex'),
+    data: encrypted.toString('base64'),
+  });
+}
+
+function decryptStore(raw) {
+  const outer = JSON.parse(raw);
+  if (outer.plain !== undefined) return outer.plain;
+  if (!ENCRYPTION_KEY) throw new Error('STORE_ENCRYPTION_KEY required to read encrypted token store');
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm',
+    ENCRYPTION_KEY,
+    Buffer.from(outer.iv, 'hex')
+  );
+  decipher.setAuthTag(Buffer.from(outer.authTag, 'hex'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(outer.data, 'base64')),
+    decipher.final(),
+  ]).toString('utf8');
+}
+
 // ── Persistence helpers ────────────────────────────────────────────────────────
 
 function loadStore() {
   try {
     if (fs.existsSync(storePath)) {
-      const raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+      const raw = decryptStore(fs.readFileSync(storePath, 'utf8'));
+      const data = JSON.parse(raw);
+
+      let usedTokens;
+      if (Array.isArray(data.usedTokens)) {
+        usedTokens = new Map(data.usedTokens.map(id => [id, '__legacy__']));
+      } else {
+        usedTokens = new Map(Object.entries(data.usedTokens || {}));
+      }
+
       return {
-        families:   new Map(Object.entries(raw.families  || {})),
-        usedTokens: new Set(raw.usedTokens || []),
+        families: new Map(
+          Object.entries(data.families || {}).map(([k, v]) => [
+            k,
+            { ...v, tokens: new Set(v.tokens || []) },
+          ])
+        ),
+        usedTokens,
+        googleTokens: new Map(Object.entries(data.googleTokens || {})),
+        pendingStates: new Map(Object.entries(data.pendingStates || {})),
       };
     }
   } catch (err) {
     logger.error('Failed to load token store, starting fresh', { error: err.message });
   }
-  return { families: new Map(), usedTokens: new Set() };
+  return { families: new Map(), usedTokens: new Map(), googleTokens: new Map(), pendingStates: new Map() };
 }
 
 function saveStore() {
   try {
     const data = {
-      families:   Object.fromEntries(state.families),
-      usedTokens: [...state.usedTokens],
+      families: Object.fromEntries(
+        [...state.families.entries()].map(([k, v]) => [
+          k,
+          { ...v, tokens: [...v.tokens] },
+        ])
+      ),
+      usedTokens:   Object.fromEntries(state.usedTokens),
+      googleTokens: Object.fromEntries(state.googleTokens),
+      pendingStates: Object.fromEntries(state.pendingStates),
     };
-    fs.writeFileSync(storePath, JSON.stringify(data), 'utf8');
+    fs.writeFileSync(storePath, encryptStore(JSON.stringify(data)), { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(storePath, 0o600); } catch { /* ignore */ }
   } catch (err) {
     logger.error('Failed to persist token store', { error: err.message });
   }
@@ -90,7 +155,6 @@ class TokenManager {
 
     const { userId, familyId, tokenId } = decoded;
 
-    // Replay attack: token already used
     if (state.usedTokens.has(tokenId)) {
       logger.security('REFRESH_TOKEN_REUSE_DETECTED', { userId, familyId, tokenId, ipAddress });
       this.revokeTokenFamily(familyId);
@@ -99,56 +163,122 @@ class TokenManager {
 
     const family = state.families.get(familyId);
 
-    // Unknown family (revoked or expired)
     if (!family || !family.tokens.has(tokenId)) {
       logger.security('INVALID_TOKEN_FAMILY', { userId, familyId, ipAddress });
       throw new Error('Invalid token family');
     }
 
-    // Mark old token as used and remove from active set
-    state.usedTokens.add(tokenId);
+    state.usedTokens.set(tokenId, familyId);
     family.tokens.delete(tokenId);
 
-    // Issue new pair
     const newAccessToken  = this.generateAccessToken(userId, familyId);
     const newRefreshToken = this.generateRefreshToken(userId, familyId);
-
-    // generateRefreshToken calls saveStore(); no extra save needed
 
     logger.info('Token rotated successfully', { userId, familyId });
 
     return { accessToken: newAccessToken, refreshToken: newRefreshToken };
   }
 
+  // ── OAuth State Management (CSRF protection) ──────────────────────────────
+
+  storePendingState(stateToken) {
+    state.pendingStates.set(stateToken, Date.now() + 10 * 60 * 1000);
+    saveStore();
+  }
+
+  consumePendingState(stateToken) {
+    const expiry = state.pendingStates.get(stateToken);
+    if (!expiry) return false;
+    state.pendingStates.delete(stateToken);
+    saveStore();
+    return Date.now() < expiry;
+  }
+
+  // ── Google Token Storage ──────────────────────────────────────────────────
+
+  storeGoogleTokens(userId, tokens) {
+    state.googleTokens.set(userId, {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      expiryDate: tokens.expiry_date,
+      updatedAt: Date.now(),
+    });
+    saveStore();
+  }
+
+  getGoogleTokens(userId) {
+    return state.googleTokens.get(userId) || null;
+  }
+
+  updateGoogleAccessToken(userId, accessToken, expiryDate) {
+    const existing = state.googleTokens.get(userId);
+    if (existing) {
+      existing.accessToken = accessToken;
+      existing.expiryDate = expiryDate;
+      existing.updatedAt = Date.now();
+      saveStore();
+    }
+  }
+
+  removeGoogleTokens(userId) {
+    state.googleTokens.delete(userId);
+    saveStore();
+  }
+
   revokeTokenFamily(familyId) {
     const family = state.families.get(familyId);
     if (family) {
-      family.tokens.forEach(id => state.usedTokens.add(id));
+      family.tokens.forEach(id => state.usedTokens.set(id, familyId));
       state.families.delete(familyId);
       saveStore();
       logger.security('TOKEN_FAMILY_REVOKED', { familyId });
     }
   }
 
+  persistNow() {
+    saveStore();
+  }
+
   cleanup() {
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
     let removed = 0;
+    const deletedFamilyIds = new Set();
 
     for (const [familyId, family] of state.families.entries()) {
       if (family.createdAt < cutoff) {
-        family.tokens.forEach(id => state.usedTokens.add(id));
+        deletedFamilyIds.add(familyId);
         state.families.delete(familyId);
         removed++;
       }
     }
 
-    // Prune usedTokens older than 7 days by keeping only IDs still referenced
-    // (they expire naturally via JWT; Set size is bounded by active traffic)
-    if (removed > 0) {
+    const previousSize = state.usedTokens.size;
+    for (const [tokenId, familyId] of state.usedTokens.entries()) {
+      if (deletedFamilyIds.has(familyId) || familyId === '__legacy__') {
+        state.usedTokens.delete(tokenId);
+      }
+    }
+    const pruned = previousSize - state.usedTokens.size;
+
+    const now = Date.now();
+    for (const [stateToken, expiry] of state.pendingStates.entries()) {
+      if (now >= expiry) {
+        state.pendingStates.delete(stateToken);
+      }
+    }
+
+    const activeUserIds = new Set([...state.families.values()].map(f => f.userId));
+    for (const userId of state.googleTokens.keys()) {
+      if (!activeUserIds.has(userId)) {
+        state.googleTokens.delete(userId);
+      }
+    }
+
+    if (removed > 0 || pruned > 0) {
       saveStore();
     }
 
-    logger.info('Token cleanup completed', { removedFamilies: removed });
+    logger.info('Token cleanup completed', { removedFamilies: removed, prunedTokens: pruned });
   }
 }
 
