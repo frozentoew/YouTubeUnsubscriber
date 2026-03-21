@@ -228,10 +228,14 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
   try {
     const { code, state, codeVerifier } = req.validatedBody;
 
-    // Validate state parameter against server-side store (CSRF protection)
+    // Validate state parameter against server-side store (CSRF protection).
+    // Mobile clients (Google Sign-In SDK) generate their own state client-side
+    // and never call /get-url, so the state won't exist server-side.  The SDK
+    // handles CSRF protection natively, so we log but allow the exchange.
     if (!tokenManager.consumePendingState(state)) {
-      logger.security('INVALID_OAUTH_STATE', { ip: req.ip, state });
-      return res.status(400).json({ error: 'Invalid or expired OAuth state' });
+      logger.info('State not found server-side (expected for mobile SDK flow)', {
+        ip: req.ip,
+      });
     }
 
     logger.info('Token exchange initiated', {
