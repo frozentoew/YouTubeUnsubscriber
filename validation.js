@@ -14,7 +14,10 @@ const schemas = {
   subscriptionsList: Joi.object({}),
 
   subscriptionsDelete: Joi.object({
-    subscriptionId: Joi.string().min(10).max(200).required(),
+    // YouTube subscription IDs are base64url-safe alphanumeric strings.
+    // Reject anything containing characters outside that alphabet to prevent
+    // injection attempts from reaching the YouTube API.
+    subscriptionId: Joi.string().min(10).max(200).pattern(/^[a-zA-Z0-9_-]+$/).required(),
   }),
 };
 

@@ -217,16 +217,15 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
   try {
     const { code, state, codeVerifier } = req.validatedBody;
 
-    // SECURITY NOTE — CSRF protection for the mobile flow:
-    // Mobile clients (Google Sign-In SDK) generate state client-side and never
-    // call /get-url, so the state won't exist server-side.  For these clients,
-    // CSRF protection is provided entirely by the PKCE code_verifier (RFC 7636),
-    // which binds the auth code to the session that initiated the request.
-    // The state check below only protects the web /get-url flow.
+    // CSRF protection: all clients (mobile and web) must present a server-issued
+    // state token obtained from POST /api/auth/get-url before initiating OAuth.
+    // This ensures the exchange request was initiated by code that first talked
+    // to our backend, preventing cross-site request forgery via crafted redirects.
     if (!tokenManager.consumePendingState(state)) {
-      logger.info('State not found server-side (mobile SDK flow — CSRF delegated to PKCE)', {
+      logger.security('INVALID_OAUTH_STATE', {
         ip: req.ip,
       });
+      return res.status(400).json({ error: 'Invalid or expired OAuth state' });
     }
 
     logger.info('Token exchange initiated', {
