@@ -1,4 +1,4 @@
-# YouTube Unsubscriber
+# MassDrop: Unsubscirbe all your subscribed channels at once!
 
 **Clean up your YouTube subscriptions in seconds.**
 
