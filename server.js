@@ -101,6 +101,20 @@ const deleteLimiter = rateLimit({
   },
 });
 
+// One batch-delete session per user per minute — prevents concurrent batch runs
+const batchDeleteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1,
+  keyGenerator: (req) => req.user?.userId || req.ip,
+  handler: (req, res) => {
+    logger.security('BATCH_DELETE_RATE_LIMIT_EXCEEDED', {
+      userId: req.user?.userId,
+      ip: req.ip,
+    });
+    res.status(429).json({ error: 'A batch unsubscribe is already in progress. Please wait.' });
+  },
+});
+
 // Request logging middleware
 app.use((req, res, next) => {
   logger.http(`${req.method} ${req.path}`, {
@@ -214,25 +228,26 @@ app.post('/api/auth/get-url', authLimiter, (req, res) => {
 
 // Exchange authorization code for tokens with PKCE verification
 app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), async (req, res) => {
+  const attemptedAt = new Date().toISOString();
+
   try {
     const { code, state, codeVerifier } = req.validatedBody;
 
-    // SECURITY NOTE — CSRF protection for the mobile flow:
-    // Mobile clients (Google Sign-In SDK) generate state client-side and never
-    // call /get-url, so the state won't exist server-side.  For these clients,
-    // CSRF protection is provided entirely by the PKCE code_verifier (RFC 7636),
-    // which binds the auth code to the session that initiated the request.
-    // The state check below only protects the web /get-url flow.
+    // CSRF protection: all clients (mobile and web) must present a server-issued
+    // state token obtained from POST /api/auth/get-url before initiating OAuth.
+    // This ensures the exchange request was initiated by code that first talked
+    // to our backend, preventing cross-site request forgery via crafted redirects.
     if (!tokenManager.consumePendingState(state)) {
-      logger.info('State not found server-side (mobile SDK flow — CSRF delegated to PKCE)', {
+      logger.security('INVALID_OAUTH_STATE', { ip: req.ip });
+      logger.authEvent('FAILED', {
         ip: req.ip,
+        reason: 'Invalid or expired OAuth state',
+        attemptedAt,
       });
+      return res.status(400).json({ error: 'Invalid or expired OAuth state' });
     }
 
-    logger.info('Token exchange initiated', {
-      state,
-      ip: req.ip,
-    });
+    logger.authEvent('ATTEMPT', { ip: req.ip, attemptedAt });
 
     const client = createOAuth2Client();
     const { tokens } = await client.getToken({
@@ -247,17 +262,23 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
       idToken: tokens.id_token,
       audience: process.env.GOOGLE_CLIENT_ID,
     });
-    const userId = ticket.getPayload().sub;
+    const payload = ticket.getPayload();
+    const userId = payload.sub;
 
     tokenManager.storeGoogleTokens(userId, tokens);
 
     const appAccessToken = tokenManager.generateAccessToken(userId, familyId);
     const appRefreshToken = tokenManager.generateRefreshToken(userId, familyId);
 
-    logger.info('Token exchange successful', {
+    logger.authEvent('SUCCESS', {
+      account: payload.email,
+      name: payload.name,
       userId,
-      familyId,
+      attemptedAt,
+      succeededAt: new Date().toISOString(),
     });
+
+    logger.info('Token exchange successful', { userId, familyId });
 
     res.json({
       appToken: appAccessToken,
@@ -270,6 +291,12 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
       ip: req.ip,
       error: error.response?.data?.error || error.message,
       errorDescription: error.response?.data?.error_description,
+    });
+    logger.authEvent('FAILED', {
+      ip: req.ip,
+      reason: error.response?.data?.error || error.message,
+      errorDescription: error.response?.data?.error_description,
+      attemptedAt,
     });
 
     res.status(400).json({ error: 'Failed to exchange authorization code' });
@@ -346,6 +373,7 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
 
     let allSubscriptions = [];
     let nextPageToken = null;
+    let pagesFetched = 0;
 
     do {
       const response = await youtube.subscriptions.list({
@@ -355,6 +383,7 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
         pageToken: nextPageToken,
       });
 
+      pagesFetched++;
       allSubscriptions = allSubscriptions.concat(response.data.items);
       nextPageToken = response.data.nextPageToken;
     } while (nextPageToken);
@@ -362,6 +391,8 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
     logger.info('Subscriptions fetched', {
       userId: req.user.userId,
       count: allSubscriptions.length,
+      apiUnitsUsed: pagesFetched,         // 1 unit per page request
+      totalPages: pagesFetched,
     });
 
     res.json({
@@ -381,6 +412,11 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
     });
 
     if (error.code === 403) {
+      logger.warn('QUOTA_EXCEEDED', {
+        endpoint: 'subscriptions/list',
+        userId: req.user?.userId,
+        apiUnitsUsedBeforeHit: pagesFetched ?? 0,
+      });
       return res.status(403).json({
         error: 'Quota exceeded. Try again after 08:00 UTC.',
         quotaExceeded: true,
@@ -413,6 +449,7 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
     logger.info('Subscription deleted', {
       userId: req.user.userId,
       subscriptionId,
+      apiUnitsUsed: 50,   // subscriptions.delete costs 50 units
     });
 
     res.json({ success: true });
@@ -425,6 +462,11 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
     });
 
     if (error.code === 403) {
+      logger.warn('QUOTA_EXCEEDED', {
+        endpoint: 'subscriptions/delete',
+        userId: req.user?.userId,
+        subscriptionId: req.validatedBody?.subscriptionId,
+      });
       return res.status(403).json({
         error: 'Quota exceeded',
         quotaExceeded: true,
@@ -438,6 +480,81 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
 
     res.status(500).json({ error: 'Failed to unsubscribe' });
   }
+});
+
+// Bulk unsubscribe — processes all requested deletions in one call and logs an aggregate session summary.
+// quotaUsed reflects every API call that reached YouTube (50 units each), whether it succeeded or not.
+// Items skipped after a quota-exhausted abort are NOT counted toward quotaUsed.
+app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimiter, validate(schemas.subscriptionsBatchDelete), async (req, res) => {
+  const { subscriptionIds } = req.validatedBody;
+
+  const youtube = await getYouTubeClient(req.user.userId);
+  if (!youtube) {
+    return res.status(401).json({ error: 'Google account not linked', reloginRequired: true });
+  }
+
+  const results = {
+    attempted: subscriptionIds.length,
+    succeeded: 0,
+    failed: 0,
+    failures: [],
+    quotaUsed: 0,
+  };
+
+  for (let i = 0; i < subscriptionIds.length; i++) {
+    const subscriptionId = subscriptionIds[i];
+    try {
+      await youtube.subscriptions.delete({ id: subscriptionId });
+      results.succeeded++;
+      results.quotaUsed += 50;
+    } catch (err) {
+      const reason =
+        err.response?.data?.error?.errors?.[0]?.reason ||
+        err.response?.data?.error?.message ||
+        err.message;
+
+      if (err.code === 403) {
+        // Quota exhausted — count this call, then skip the rest without hitting the API
+        results.quotaUsed += 50;
+        results.failed++;
+        results.failures.push({ subscriptionId, reason: 'Quota exceeded' });
+
+        for (let j = i + 1; j < subscriptionIds.length; j++) {
+          results.failed++;
+          results.failures.push({ subscriptionId: subscriptionIds[j], reason: 'Quota exceeded — skipped' });
+        }
+        break;
+      }
+
+      if (err.code === 401) {
+        results.quotaUsed += 50;
+        results.failed++;
+        results.failures.push({ subscriptionId, reason: 'Authentication expired' });
+
+        for (let j = i + 1; j < subscriptionIds.length; j++) {
+          results.failed++;
+          results.failures.push({ subscriptionId: subscriptionIds[j], reason: 'Authentication expired — skipped' });
+        }
+        break;
+      }
+
+      results.quotaUsed += 50;
+      results.failed++;
+      results.failures.push({ subscriptionId, reason });
+    }
+  }
+
+  logger.unsubscribeSession({
+    userId: req.user.userId,
+    attempted: results.attempted,
+    succeeded: results.succeeded,
+    failed: results.failed,
+    failures: results.failures,
+    quotaUsed: results.quotaUsed,
+  });
+
+  const status = results.succeeded === results.attempted ? 200 : 207;
+  res.status(status).json(results);
 });
 
 // Error handling middleware

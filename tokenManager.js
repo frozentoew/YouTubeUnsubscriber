@@ -14,14 +14,14 @@ const ENCRYPTION_KEY = process.env.STORE_ENCRYPTION_KEY
   : null;
 
 if (!ENCRYPTION_KEY) {
-  logger.warn('STORE_ENCRYPTION_KEY not set — token store will not be encrypted at rest');
+  logger.error('STORE_ENCRYPTION_KEY not set — Google OAuth tokens cannot be encrypted at rest. Refusing to start.');
+  process.exit(1);
 } else if (ENCRYPTION_KEY.length !== 32) {
   logger.error('STORE_ENCRYPTION_KEY must be 32 bytes (64 hex chars) — exiting');
   process.exit(1);
 }
 
 function encryptStore(plaintext) {
-  if (!ENCRYPTION_KEY) return JSON.stringify({ plain: plaintext });
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
@@ -34,8 +34,12 @@ function encryptStore(plaintext) {
 
 function decryptStore(raw) {
   const outer = JSON.parse(raw);
-  if (outer.plain !== undefined) return outer.plain;
-  if (!ENCRYPTION_KEY) throw new Error('STORE_ENCRYPTION_KEY required to read encrypted token store');
+  if (outer.plain !== undefined) {
+    // Legacy plaintext store detected — refuse to load it unencrypted.
+    // Re-encrypt by letting the caller re-save after this startup.
+    logger.warn('Plaintext token store detected — discarding and starting fresh (re-login required)');
+    throw new Error('Plaintext store not supported — encryption is now required');
+  }
   const decipher = crypto.createDecipheriv(
     'aes-256-gcm',
     ENCRYPTION_KEY,

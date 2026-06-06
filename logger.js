@@ -1,7 +1,7 @@
 const winston = require('winston');
 const DailyRotateFile = require('winston-daily-rotate-file');
+const logStore = require('./db/logStore');
 
-// Define log levels
 const levels = {
   error: 0,
   warn: 1,
@@ -10,7 +10,6 @@ const levels = {
   debug: 4,
 };
 
-// Define colors for each level
 const colors = {
   error: 'red',
   warn: 'yellow',
@@ -21,27 +20,29 @@ const colors = {
 
 winston.addColors(colors);
 
-// Custom format for security events
-const securityFormat = winston.format.printf(({ level, message, timestamp, ...metadata }) => {
+const baseFormat = winston.format.printf(({ level, message, timestamp, ...metadata }) => {
   let msg = `${timestamp} [${level}]: ${message}`;
-  
   if (Object.keys(metadata).length > 0) {
     msg += ` | ${JSON.stringify(metadata)}`;
   }
-  
   return msg;
 });
 
-// File rotation for security logs
-const securityTransport = new DailyRotateFile({
-  filename: 'logs/security-%DATE%.log',
-  datePattern: 'YYYY-MM-DD',
-  maxSize: '20m',
-  maxFiles: '14d',
-  level: 'warn',
-});
+const sharedFormat = winston.format.combine(
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  winston.format.errors({ stack: true }),
+  baseFormat
+);
 
-// File rotation for general logs
+const isDev = process.env.NODE_ENV !== 'production';
+
+function makeConsole() {
+  return new winston.transports.Console({
+    format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+  });
+}
+
+// General app log
 const appTransport = new DailyRotateFile({
   filename: 'logs/app-%DATE%.log',
   datePattern: 'YYYY-MM-DD',
@@ -50,33 +51,99 @@ const appTransport = new DailyRotateFile({
   level: 'info',
 });
 
-// Console transport for development
-const consoleTransport = new winston.transports.Console({
-  format: winston.format.combine(
-    winston.format.colorize(),
-    winston.format.simple()
-  ),
+// Security events (warn+)
+const securityTransport = new DailyRotateFile({
+  filename: 'logs/security-%DATE%.log',
+  datePattern: 'YYYY-MM-DD',
+  maxSize: '20m',
+  maxFiles: '14d',
+  level: 'warn',
 });
 
-// Create logger instance
+// Sign-in attempts and results — kept 30 days for audit purposes
+const authTransport = new DailyRotateFile({
+  filename: 'logs/auth-%DATE%.log',
+  datePattern: 'YYYY-MM-DD',
+  maxSize: '20m',
+  maxFiles: '30d',
+  level: 'info',
+});
+
+// Unsubscribe session summaries
+const activityTransport = new DailyRotateFile({
+  filename: 'logs/activity-%DATE%.log',
+  datePattern: 'YYYY-MM-DD',
+  maxSize: '20m',
+  maxFiles: '14d',
+  level: 'info',
+});
+
 const logger = winston.createLogger({
   levels,
-  format: winston.format.combine(
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    winston.format.errors({ stack: true }),
-    securityFormat
-  ),
+  format: sharedFormat,
   transports: [
     securityTransport,
     appTransport,
-    ...(process.env.NODE_ENV !== 'production' ? [consoleTransport] : []),
+    ...(isDev ? [makeConsole()] : []),
   ],
   exitOnError: false,
 });
 
-// Security event logger
+// Writes to logs/auth-*.log
+// event: 'ATTEMPT' | 'SUCCESS' | 'FAILED'
+// SUCCESS metadata: { account, name, userId }
+// FAILED  metadata: { ip, reason, errorDescription? }
+const authLogger = winston.createLogger({
+  levels,
+  format: sharedFormat,
+  transports: [
+    authTransport,
+    ...(isDev ? [makeConsole()] : []),
+  ],
+  exitOnError: false,
+});
+
+// Writes to logs/activity-*.log
+// metadata: { userId, attempted, succeeded, failed, failures, quotaUsed }
+const activityLogger = winston.createLogger({
+  levels,
+  format: sharedFormat,
+  transports: [
+    activityTransport,
+    ...(isDev ? [makeConsole()] : []),
+  ],
+  exitOnError: false,
+});
+
+// Replaces all characters after the first 3 with X's.
+// e.g. "john.doe@gmail.com" → "johXXXXXXXXXXXXXXX"
+function maskName(value) {
+  if (!value || typeof value !== 'string') return value;
+  if (value.length <= 3) return value;
+  return value.slice(0, 3) + 'X'.repeat(value.length - 3);
+}
+
 logger.security = (event, metadata) => {
   logger.warn(`SECURITY_EVENT: ${event}`, metadata);
+};
+
+// Logs a sign-in lifecycle event to logs/auth-*.log and the auth_events DB table.
+// Account names and display names are masked before writing to either destination.
+// event: 'ATTEMPT' | 'SUCCESS' | 'FAILED'
+logger.authEvent = (event, metadata) => {
+  const safe = { ...metadata };
+  if (safe.account) safe.account = maskName(safe.account);
+  if (safe.name)    safe.name    = maskName(safe.name);
+
+  authLogger.info(`AUTH_${event}`, safe);
+  logStore.saveAuthEvent({ event, ...safe });
+};
+
+// Logs the aggregate result of a bulk-unsubscribe session to logs/activity-*.log
+// and the unsubscribe_sessions / unsubscribe_failures DB tables.
+logger.unsubscribeSession = (metadata) => {
+  activityLogger.info('UNSUBSCRIBE_SESSION', metadata);
+  logStore.saveUnsubscribeSession({ ...metadata, sessionAt: new Date().toISOString() });
 };
 
 module.exports = logger;
