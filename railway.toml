@@ -11,4 +11,7 @@ healthcheckTimeout = 30
 # IMPORTANT: After deploying, add a Railway Volume and set:
 #   Mount Path: /data
 #   DB_PATH env var: /data/tokens.json
-# This ensures the token store persists across deploys and restarts.
+#   LOG_DIR env var: /data/logs
+#   LOG_DB_DIR env var: /data/db
+# This ensures the token store, activity logs, and log database
+# persist across deploys and restarts.

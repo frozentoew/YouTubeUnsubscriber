@@ -1,6 +1,12 @@
+const fs = require('fs');
 const winston = require('winston');
 const DailyRotateFile = require('winston-daily-rotate-file');
 const logStore = require('./db/logStore');
+
+// LOG_DIR can be overridden via env var — set to /data/logs on Railway with a volume
+// so log files survive deploys/restarts.
+const LOG_DIR = process.env.LOG_DIR || 'logs';
+fs.mkdirSync(LOG_DIR, { recursive: true });
 
 const levels = {
   error: 0,
@@ -44,7 +50,7 @@ function makeConsole() {
 
 // General app log
 const appTransport = new DailyRotateFile({
-  filename: 'logs/app-%DATE%.log',
+  filename: `${LOG_DIR}/app-%DATE%.log`,
   datePattern: 'YYYY-MM-DD',
   maxSize: '20m',
   maxFiles: '7d',
@@ -53,7 +59,7 @@ const appTransport = new DailyRotateFile({
 
 // Security events (warn+)
 const securityTransport = new DailyRotateFile({
-  filename: 'logs/security-%DATE%.log',
+  filename: `${LOG_DIR}/security-%DATE%.log`,
   datePattern: 'YYYY-MM-DD',
   maxSize: '20m',
   maxFiles: '14d',
@@ -62,7 +68,7 @@ const securityTransport = new DailyRotateFile({
 
 // Sign-in attempts and results — kept 30 days for audit purposes
 const authTransport = new DailyRotateFile({
-  filename: 'logs/auth-%DATE%.log',
+  filename: `${LOG_DIR}/auth-%DATE%.log`,
   datePattern: 'YYYY-MM-DD',
   maxSize: '20m',
   maxFiles: '30d',
@@ -71,7 +77,7 @@ const authTransport = new DailyRotateFile({
 
 // Unsubscribe session summaries
 const activityTransport = new DailyRotateFile({
-  filename: 'logs/activity-%DATE%.log',
+  filename: `${LOG_DIR}/activity-%DATE%.log`,
   datePattern: 'YYYY-MM-DD',
   maxSize: '20m',
   maxFiles: '14d',
