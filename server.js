@@ -452,6 +452,15 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
       apiUnitsUsed: 50,   // subscriptions.delete costs 50 units
     });
 
+    logger.unsubscribeSession({
+      userId: req.user.userId,
+      attempted: 1,
+      succeeded: 1,
+      failed: 0,
+      failures: [],
+      quotaUsed: 50,
+    });
+
     res.json({ success: true });
 
   } catch (error) {
@@ -459,6 +468,20 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
       userId: req.user?.userId,
       error: error.message,
       code: error.code,
+    });
+
+    const reason =
+      error.response?.data?.error?.errors?.[0]?.reason ||
+      error.response?.data?.error?.message ||
+      error.message;
+
+    logger.unsubscribeSession({
+      userId: req.user?.userId,
+      attempted: 1,
+      succeeded: 0,
+      failed: 1,
+      failures: [{ subscriptionId: req.validatedBody?.subscriptionId, reason }],
+      quotaUsed: 50,
     });
 
     if (error.code === 403) {
