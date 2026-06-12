@@ -8,6 +8,12 @@ const logStore = require('./db/logStore');
 const LOG_DIR = process.env.LOG_DIR || 'logs';
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
+// Spreadsheet-friendly running export of unsubscribe sessions
+const CSV_PATH = `${LOG_DIR}/unsubscribe_sessions.csv`;
+if (!fs.existsSync(CSV_PATH)) {
+  fs.writeFileSync(CSV_PATH, 'session_at,user_id,attempted,succeeded,failed,quota_used\n');
+}
+
 const levels = {
   error: 0,
   warn: 1,
@@ -121,12 +127,12 @@ const activityLogger = winston.createLogger({
   exitOnError: false,
 });
 
-// Replaces all characters after the first 3 with X's.
-// e.g. "john.doe@gmail.com" → "johXXXXXXXXXXXXXXX"
+// Replaces all characters after the first 3 with *'s.
+// e.g. "john.doe@gmail.com" → "joh****************"
 function maskName(value) {
   if (!value || typeof value !== 'string') return value;
   if (value.length <= 3) return value;
-  return value.slice(0, 3) + 'X'.repeat(value.length - 3);
+  return value.slice(0, 3) + '*'.repeat(value.length - 3);
 }
 
 logger.security = (event, metadata) => {
@@ -145,11 +151,21 @@ logger.authEvent = (event, metadata) => {
   logStore.saveAuthEvent({ event, ...safe });
 };
 
-// Logs the aggregate result of a bulk-unsubscribe session to logs/activity-*.log
-// and the unsubscribe_sessions / unsubscribe_failures DB tables.
+// Logs the aggregate result of a bulk-unsubscribe session to logs/activity-*.log,
+// the unsubscribe_sessions / unsubscribe_failures DB tables, and
+// unsubscribe_sessions.csv for easy spreadsheet viewing.
 logger.unsubscribeSession = (metadata) => {
+  const sessionAt = new Date().toISOString();
+
   activityLogger.info('UNSUBSCRIBE_SESSION', metadata);
-  logStore.saveUnsubscribeSession({ ...metadata, sessionAt: new Date().toISOString() });
+  logStore.saveUnsubscribeSession({ ...metadata, sessionAt });
+
+  try {
+    const row = [sessionAt, metadata.userId, metadata.attempted, metadata.succeeded, metadata.failed, metadata.quotaUsed].join(',');
+    fs.appendFileSync(CSV_PATH, row + '\n');
+  } catch (err) {
+    console.error('[logger] failed to append unsubscribe_sessions.csv:', err.message);
+  }
 };
 
 module.exports = logger;
