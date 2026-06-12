@@ -14,6 +14,26 @@ if (!fs.existsSync(CSV_PATH)) {
   fs.writeFileSync(CSV_PATH, 'session_at,user_id,attempted,succeeded,failed,quota_used\n');
 }
 
+// Spreadsheet-friendly running export of auth events
+const AUTH_CSV_PATH = `${LOG_DIR}/auth_events.csv`;
+if (!fs.existsSync(AUTH_CSV_PATH)) {
+  fs.writeFileSync(AUTH_CSV_PATH, 'event,account,name,user_id,ip,reason,error_description,attempted_at,succeeded_at\n');
+}
+
+// Escapes a value for inclusion as a single CSV field.
+function csvField(value) {
+  if (value === undefined || value === null) return '';
+  const str = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  if (/[",\n]/.test(str)) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  return str;
+}
+
+function appendCsvRow(path, values) {
+  fs.appendFileSync(path, values.map(csvField).join(',') + '\n');
+}
+
 const levels = {
   error: 0,
   warn: 1,
@@ -149,6 +169,15 @@ logger.authEvent = (event, metadata) => {
 
   authLogger.info(`AUTH_${event}`, safe);
   logStore.saveAuthEvent({ event, ...safe });
+
+  try {
+    appendCsvRow(AUTH_CSV_PATH, [
+      event, safe.account, safe.name, safe.userId, safe.ip,
+      safe.reason, safe.errorDescription, safe.attemptedAt, safe.succeededAt,
+    ]);
+  } catch (err) {
+    console.error('[logger] failed to append auth_events.csv:', err.message);
+  }
 };
 
 // Logs the aggregate result of a bulk-unsubscribe session to logs/activity-*.log,
@@ -161,8 +190,7 @@ logger.unsubscribeSession = (metadata) => {
   logStore.saveUnsubscribeSession({ ...metadata, sessionAt });
 
   try {
-    const row = [sessionAt, metadata.userId, metadata.attempted, metadata.succeeded, metadata.failed, metadata.quotaUsed].join(',');
-    fs.appendFileSync(CSV_PATH, row + '\n');
+    appendCsvRow(CSV_PATH, [sessionAt, metadata.userId, metadata.attempted, metadata.succeeded, metadata.failed, metadata.quotaUsed]);
   } catch (err) {
     console.error('[logger] failed to append unsubscribe_sessions.csv:', err.message);
   }
