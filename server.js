@@ -516,6 +516,21 @@ app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimite
     return res.status(401).json({ error: 'Google account not linked', reloginRequired: true });
   }
 
+  // Stream progress as newline-delimited JSON (NDJSON) so the client can show a
+  // live progress bar and stay connected during large runs (100+ channels).
+  // Each line is a {type:"progress"} object; the final line is {type:"result"}.
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable proxy buffering (nginx/Railway)
+  res.flushHeaders();
+
+  // Stop early if the client hangs up mid-run instead of writing to a dead socket.
+  let aborted = false;
+  res.on('close', () => { if (!res.writableEnded) aborted = true; });
+
+  const writeLine = (obj) => res.write(`${JSON.stringify(obj)}\n`);
+
   const results = {
     attempted: subscriptionIds.length,
     succeeded: 0,
@@ -525,6 +540,7 @@ app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimite
   };
 
   for (let i = 0; i < subscriptionIds.length; i++) {
+    if (aborted) break;
     const subscriptionId = subscriptionIds[i];
     try {
       await youtube.subscriptions.delete({ id: subscriptionId });
@@ -565,6 +581,14 @@ app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimite
       results.failed++;
       results.failures.push({ subscriptionId, reason });
     }
+
+    writeLine({
+      type: 'progress',
+      completed: results.succeeded + results.failed,
+      total: results.attempted,
+      succeeded: results.succeeded,
+      failed: results.failed,
+    });
   }
 
   logger.unsubscribeSession({
@@ -574,10 +598,13 @@ app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimite
     failed: results.failed,
     failures: results.failures,
     quotaUsed: results.quotaUsed,
+    aborted,
   });
 
-  const status = results.succeeded === results.attempted ? 200 : 207;
-  res.status(status).json(results);
+  if (!aborted) {
+    writeLine({ type: 'result', ...results });
+  }
+  res.end();
 });
 
 // Error handling middleware
