@@ -385,6 +385,9 @@ async function getYouTubeClient(userId) {
 
 // Get user's subscriptions
 app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscriptionsList), async (req, res) => {
+  // Declared outside the try so the catch block can reference it (e.g. when
+  // logging how many pages were fetched before a quota error).
+  let pagesFetched = 0;
   try {
     const youtube = await getYouTubeClient(req.user.userId);
     if (!youtube) {
@@ -393,7 +396,6 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
 
     let allSubscriptions = [];
     let nextPageToken = null;
-    let pagesFetched = 0;
 
     do {
       const response = await withRetry(() => youtube.subscriptions.list({
