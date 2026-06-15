@@ -341,6 +341,26 @@ app.post('/api/auth/refresh', authLimiter, validate(schemas.authRefresh), async 
 });
 
 // Helper: get an authenticated YouTube client using server-side Google tokens
+// Retry transient upstream failures (Google 5xx, dropped connections) with
+// exponential backoff. Auth (401) and quota (403) errors are NOT transient and
+// are re-thrown immediately so callers can handle them as before.
+async function withRetry(fn, { retries = 3, baseDelayMs = 300 } = {}) {
+  const TRANSIENT_NET = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EPIPE'];
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const status = typeof err.code === 'number' ? err.code : err.response?.status;
+      const isTransient = (status >= 500 && status <= 599) || TRANSIENT_NET.includes(err.code);
+      if (!isTransient || attempt === retries) throw err;
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** attempt));
+    }
+  }
+  throw lastError;
+}
+
 async function getYouTubeClient(userId) {
   const googleTokens = tokenManager.getGoogleTokens(userId);
   if (!googleTokens) {
@@ -355,7 +375,7 @@ async function getYouTubeClient(userId) {
   });
 
   if (googleTokens.expiryDate && Date.now() >= googleTokens.expiryDate - 60000) {
-    const { credentials } = await client.refreshAccessToken();
+    const { credentials } = await withRetry(() => client.refreshAccessToken());
     tokenManager.updateGoogleAccessToken(userId, credentials.access_token, credentials.expiry_date);
     client.setCredentials(credentials);
   }
@@ -376,12 +396,12 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
     let pagesFetched = 0;
 
     do {
-      const response = await youtube.subscriptions.list({
+      const response = await withRetry(() => youtube.subscriptions.list({
         part: 'snippet,id',
         mine: true,
         maxResults: 50,
         pageToken: nextPageToken,
-      });
+      }));
 
       pagesFetched++;
       allSubscriptions = allSubscriptions.concat(response.data.items);
