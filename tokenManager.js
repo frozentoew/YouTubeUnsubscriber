@@ -239,18 +239,6 @@ class TokenManager {
     }
   }
 
-  revokeAllFamiliesForUser(userId) {
-    for (const [familyId, family] of state.families.entries()) {
-      if (family.userId === userId) {
-        family.tokens.forEach(id => state.usedTokens.set(id, familyId));
-        state.families.delete(familyId);
-        logger.security('TOKEN_FAMILY_REVOKED', { familyId, reason: 'account_deletion' });
-      }
-    }
-    state.googleTokens.delete(userId);
-    saveStore();
-  }
-
   persistNow() {
     saveStore();
   }
@@ -258,21 +246,19 @@ class TokenManager {
   cleanup() {
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
     let removed = 0;
+    const deletedFamilyIds = new Set();
 
     for (const [familyId, family] of state.families.entries()) {
       if (family.createdAt < cutoff) {
+        deletedFamilyIds.add(familyId);
         state.families.delete(familyId);
         removed++;
       }
     }
 
-    // Prune consumed-token records whose family no longer exists. This covers
-    // families just expired above AND families removed out-of-band by
-    // revokeTokenFamily / revokeAllFamiliesForUser (e.g. account deletion),
-    // which would otherwise leave usedTokens entries orphaned forever.
     const previousSize = state.usedTokens.size;
     for (const [tokenId, familyId] of state.usedTokens.entries()) {
-      if (familyId === '__legacy__' || !state.families.has(familyId)) {
+      if (deletedFamilyIds.has(familyId) || familyId === '__legacy__') {
         state.usedTokens.delete(tokenId);
       }
     }

@@ -58,7 +58,7 @@ const ALLOWED_ORIGINS = process.env.NODE_ENV === 'development'
 app.use(cors({
   origin: ALLOWED_ORIGINS,
   credentials: true,
-  methods: ['GET', 'POST', 'DELETE'],
+  methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
@@ -627,35 +627,6 @@ app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimite
     writeLine({ type: 'result', ...results });
   }
   res.end();
-});
-
-// Delete account — revokes Google OAuth tokens server-side, wipes all stored
-// tokens for this user, and marks all JWT families as consumed. The client is
-// responsible for clearing its own Keychain after receiving a 200 response.
-app.delete('/api/auth/account', authenticateToken, authLimiter, async (req, res) => {
-  const { userId } = req.user;
-  try {
-    const googleTokens = tokenManager.getGoogleTokens(userId);
-    if (googleTokens?.refreshToken) {
-      try {
-        const client = createOAuth2Client();
-        await client.revokeToken(googleTokens.refreshToken);
-      } catch (revokeErr) {
-        // Token may already be expired or revoked — log and continue with local cleanup.
-        logger.warn('Google token revocation failed during account deletion', {
-          error: revokeErr.message,
-        });
-      }
-    }
-
-    tokenManager.revokeAllFamiliesForUser(userId);
-
-    logger.security('ACCOUNT_DELETED', { userId });
-    res.json({ success: true });
-  } catch (error) {
-    logger.error('Account deletion failed', { error: error.message });
-    res.status(500).json({ error: 'Failed to delete account' });
-  }
 });
 
 // Error handling middleware
