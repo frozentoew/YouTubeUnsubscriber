@@ -134,6 +134,42 @@ function createOAuth2Client() {
   );
 }
 
+// ============ YOUTUBE ERROR CLASSIFICATION ============
+
+const YOUTUBE_SCOPE = 'https://www.googleapis.com/auth/youtube.force-ssl';
+const YOUTUBE_ACCESS_MISSING_MESSAGE =
+  'MassDrop was not given permission to manage your YouTube subscriptions. ' +
+  'Please sign in again and allow YouTube access.';
+
+// YouTube returns HTTP 403 for several unrelated reasons (quota, missing
+// permission, forbidden resource, API disabled). Only genuine quota errors may
+// be reported to the client as "quota exceeded".
+const QUOTA_REASONS = new Set(['quotaExceeded', 'dailyLimitExceeded']);
+const SCOPE_REASONS = new Set(['insufficientPermissions', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT']);
+
+function isHttpStatus(err, status) {
+  return err?.code === status || err?.status === status || err?.response?.status === status;
+}
+
+function youtubeErrorReason(err) {
+  return (
+    err?.errors?.[0]?.reason ||
+    err?.response?.data?.error?.errors?.[0]?.reason ||
+    err?.response?.data?.error?.details?.[0]?.reason ||
+    null
+  );
+}
+
+// Returns 'quota' | 'scope' | 'forbidden' for a 403 from the YouTube API.
+function classifyYouTube403(err) {
+  const reason = youtubeErrorReason(err);
+  if (QUOTA_REASONS.has(reason)) return 'quota';
+  if (SCOPE_REASONS.has(reason) || /insufficient.*(scope|permission)/i.test(err?.message || '')) {
+    return 'scope';
+  }
+  return 'forbidden';
+}
+
 // ============ AUTH MIDDLEWARE ============
 
 const authenticateToken = (req, res, next) => {
@@ -205,9 +241,7 @@ app.post('/api/auth/get-url', authLimiter, (req, res) => {
 
     tokenManager.storePendingState(state);
 
-    const scopes = [
-      'https://www.googleapis.com/auth/youtube.force-ssl'
-    ];
+    const scopes = [YOUTUBE_SCOPE];
 
     const client = createOAuth2Client();
     const authUrl = client.generateAuthUrl({
@@ -255,6 +289,21 @@ app.post('/api/auth/exchange', authLimiter, validate(schemas.authExchange), asyn
       code_verifier: codeVerifier,
       redirect_uri: process.env.GOOGLE_REDIRECT_URI,
     });
+
+    // Google's consent screen lets users untick individual permissions. If the
+    // YouTube scope wasn't granted, every YouTube call would fail with 403, so
+    // reject the sign-in now with a clear message instead of storing useless tokens.
+    if (tokens.scope && !tokens.scope.split(' ').includes(YOUTUBE_SCOPE)) {
+      logger.authEvent('FAILED', {
+        ip: req.ip,
+        reason: 'YouTube scope not granted',
+        attemptedAt,
+      });
+      return res.status(403).json({
+        error: YOUTUBE_ACCESS_MISSING_MESSAGE,
+        youtubeAccessMissing: true,
+      });
+    }
 
     const familyId = tokenManager.generateFamilyId();
 
@@ -431,18 +480,29 @@ app.post('/api/subscriptions/list', authenticateToken, validate(schemas.subscrip
       userId: req.user?.userId,
       error: error.message,
       code: error.code,
+      reason: youtubeErrorReason(error),
     });
 
-    if (error.code === 403) {
-      logger.warn('QUOTA_EXCEEDED', {
-        endpoint: 'subscriptions/list',
-        userId: req.user?.userId,
-        apiUnitsUsedBeforeHit: pagesFetched ?? 0,
-      });
-      return res.status(403).json({
-        error: 'Quota exceeded. Try again after 08:00 UTC.',
-        quotaExceeded: true,
-      });
+    if (isHttpStatus(error, 403)) {
+      const kind = classifyYouTube403(error);
+      if (kind === 'quota') {
+        logger.warn('QUOTA_EXCEEDED', {
+          endpoint: 'subscriptions/list',
+          userId: req.user?.userId,
+          apiUnitsUsedBeforeHit: pagesFetched ?? 0,
+        });
+        return res.status(403).json({
+          error: 'Quota exceeded. Try again after 08:00 UTC.',
+          quotaExceeded: true,
+        });
+      }
+      if (kind === 'scope') {
+        return res.status(403).json({
+          error: YOUTUBE_ACCESS_MISSING_MESSAGE,
+          youtubeAccessMissing: true,
+        });
+      }
+      return res.status(502).json({ error: 'YouTube refused the request' });
     } else if (error.code === 401) {
       return res.status(401).json({
         error: 'Token expired',
@@ -506,16 +566,26 @@ app.post('/api/subscriptions/delete', authenticateToken, deleteLimiter, validate
       quotaUsed: 50,
     });
 
-    if (error.code === 403) {
-      logger.warn('QUOTA_EXCEEDED', {
-        endpoint: 'subscriptions/delete',
-        userId: req.user?.userId,
-        subscriptionId: req.validatedBody?.subscriptionId,
-      });
-      return res.status(403).json({
-        error: 'Quota exceeded',
-        quotaExceeded: true,
-      });
+    if (isHttpStatus(error, 403)) {
+      const kind = classifyYouTube403(error);
+      if (kind === 'quota') {
+        logger.warn('QUOTA_EXCEEDED', {
+          endpoint: 'subscriptions/delete',
+          userId: req.user?.userId,
+          subscriptionId: req.validatedBody?.subscriptionId,
+        });
+        return res.status(403).json({
+          error: 'Quota exceeded',
+          quotaExceeded: true,
+        });
+      }
+      if (kind === 'scope') {
+        return res.status(403).json({
+          error: YOUTUBE_ACCESS_MISSING_MESSAGE,
+          youtubeAccessMissing: true,
+        });
+      }
+      return res.status(502).json({ error: 'YouTube refused the request' });
     } else if (error.code === 401) {
       return res.status(401).json({
         error: 'Token expired',
@@ -574,15 +644,19 @@ app.post('/api/subscriptions/batch-delete', authenticateToken, batchDeleteLimite
         err.response?.data?.error?.message ||
         err.message;
 
-      if (err.code === 403) {
-        // Quota exhausted — count this call, then skip the rest without hitting the API
+      const kind403 = isHttpStatus(err, 403) ? classifyYouTube403(err) : null;
+
+      if (kind403 === 'quota' || kind403 === 'scope') {
+        // Quota exhausted or YouTube permission missing — every remaining call would
+        // fail the same way, so count this call and skip the rest without hitting the API.
+        const label = kind403 === 'quota' ? 'Quota exceeded' : 'YouTube access not granted';
         results.quotaUsed += 50;
         results.failed++;
-        results.failures.push({ subscriptionId, reason: 'Quota exceeded' });
+        results.failures.push({ subscriptionId, reason: label });
 
         for (let j = i + 1; j < subscriptionIds.length; j++) {
           results.failed++;
-          results.failures.push({ subscriptionId: subscriptionIds[j], reason: 'Quota exceeded — skipped' });
+          results.failures.push({ subscriptionId: subscriptionIds[j], reason: `${label} — skipped` });
         }
         break;
       }

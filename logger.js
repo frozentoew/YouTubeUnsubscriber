@@ -68,9 +68,15 @@ const sharedFormat = winston.format.combine(
 
 const isDev = process.env.NODE_ENV !== 'production';
 
+// Console output is enabled in every environment: Railway's Logs tab only shows
+// stdout/stderr, so without this production logs exist only in files on the volume.
+// Production uses the plain timestamped format (no ANSI colour codes).
 function makeConsole() {
   return new winston.transports.Console({
-    format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+    level: 'info',
+    format: isDev
+      ? winston.format.combine(winston.format.colorize(), winston.format.simple())
+      : sharedFormat,
   });
 }
 
@@ -116,7 +122,7 @@ const logger = winston.createLogger({
   transports: [
     securityTransport,
     appTransport,
-    ...(isDev ? [makeConsole()] : []),
+    makeConsole(),
   ],
   exitOnError: false,
 });
@@ -130,7 +136,7 @@ const authLogger = winston.createLogger({
   format: sharedFormat,
   transports: [
     authTransport,
-    ...(isDev ? [makeConsole()] : []),
+    makeConsole(),
   ],
   exitOnError: false,
 });
@@ -142,7 +148,7 @@ const activityLogger = winston.createLogger({
   format: sharedFormat,
   transports: [
     activityTransport,
-    ...(isDev ? [makeConsole()] : []),
+    makeConsole(),
   ],
   exitOnError: false,
 });
